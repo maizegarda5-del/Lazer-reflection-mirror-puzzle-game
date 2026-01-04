@@ -1,305 +1,415 @@
--- Lazer puzzle game main script
--- - Uses Raycasting, Tweening, RunService heartbeat, and basic physics/rooting checks.
+-- Lazer puzzle main LocalScript
 
 local TweenService = game:GetService("TweenService")
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local MoveMirrorEvent = ReplicatedStorage:WaitForChild("Events"):WaitForChild("MoveMirror")
-local player = game.Players.LocalPlayer
-local Button = player.PlayerGui:WaitForChild("ScreenGui"):WaitForChild("Button")
-local heartbeatConnections, laserSegments, laserFillers = {}, {}, {}
-local lasersHitGoal, laserActive = {}, false
-local pointingAtTarget, pointingStartTime, timeOfLastHit = false, nil, nil
-local timeToWait = 3
+local UserInputService = game:GetService("UserInputService")
+local Players = game:GetService("Players")
+local Debris = game:GetService("Debris")
 
--- Simple leaderstats container 
-local Leaderstats = Instance.new("Folder", player)
-Leaderstats.Name = "leaderstats" -- be explicit
-local Level = Instance.new("NumberValue", Leaderstats)
-Level.Name = "Level"
-local LevelMap = nil
+local EventsFolder = ReplicatedStorage:WaitForChild("Events")
+local MoveMirrorEvent = EventsFolder:FindFirstChild("MoveMirror")
+
+local localPlayer = Players.LocalPlayer
+local playerGui = localPlayer:WaitForChild("PlayerGui")
 local cam = workspace.CurrentCamera
 
--- Force scriptable camera. I intentionally wait so camera is always scriptable here.
-repeat wait() cam.CameraType = Enum.CameraType.Scriptable until cam.CameraType == Enum.CameraType.Scriptable
+-- Constants (easy to tune)
+local MAX_LASER_DISTANCE = 1000
+local MAX_BOUNCES = 50
+local FILLER_TWEEN_TIME = 3
+local WAIT_AFTER_ALL_HIT = 3
+local LASER_THICKNESS = 0.2
 
--- Helper: create a neon laser segment between two points
+-- State
+local heartbeatConnections = {}
+local laserSegments = {}
+local laserFillers = {}
+local lasersHitGoal = {}
+local laserActive = false
+local pointingAtTarget, pointingStartTime, timeOfLastHit = false, nil, nil
+
+-- Leaderstats / Level
+local Leaderstats = Instance.new("Folder")
+Leaderstats.Name = "leaderstats"
+Leaderstats.Parent = localPlayer
+
+local Level = Instance.new("NumberValue")
+Level.Name = "Level"
+Level.Parent = Leaderstats
+
+local LevelMap = nil
+
+-- Ensure camera can be controlled by script.
+-- We perform a small number of attempts and then give up to avoid tight infinite loops.
+do
+	local attempts = 0
+	while cam.CameraType ~= Enum.CameraType.Scriptable and attempts < 10 do
+		cam.CameraType = Enum.CameraType.Scriptable
+		task.wait(0.05)
+		attempts = attempts + 1
+	end
+end
+
+-- Utility: approximate axis-aligned normal checks.
+-- Because raycast normals may not be exact, check dot product with axis.
+local function isAxis(normal, axis, tol)
+	tol = tol or 0.999
+	return normal:Dot(axis) >= tol
+end
+
+-- Create a neon laser segment between two points.
+-- Keep parts small and anchored (visual only).
 local function CreateLaserSegment(startPos, endPos, color)
+	if not (startPos and endPos) then return nil end
 	local segment = Instance.new("Part")
 	segment.Name = "Laser"
 	segment.Material = Enum.Material.Neon
 	segment.CastShadow = false
-	segment.Size = Vector3.new(0.2, 0.2, (endPos - startPos).Magnitude)
+	segment.Size = Vector3.new(LASER_THICKNESS, LASER_THICKNESS, (endPos - startPos).Magnitude)
 	segment.Color = color
 	segment.Anchored = true
 	segment.CanCollide = false
 	segment.CanTouch = false
 	segment.CanQuery = false
 	segment.Locked = true
-	-- orient the part so it faces the end position
 	segment.CFrame = CFrame.new((startPos + endPos) / 2, endPos)
-	segment.Parent = workspace:FindFirstChild("Lasers") or workspace -- safe fallback
+	local container = workspace:FindFirstChild("Lasers") or workspace
+	segment.Parent = container
 	return segment
 end
 
--- Clear laser segments. If Color passed, only remove that color; otherwise clear all laser parts.
-local function ClearLaserSegments(Color)
-	for _, laser in ipairs((workspace:FindFirstChild("Lasers") and workspace.Lasers:GetChildren()) or {}) do
-		if not Color or laser.Color == Color then
-			laser:Destroy()
+-- Remove laser segments (optionally only by color).
+local function ClearLaserSegments(color)
+	local container = workspace:FindFirstChild("Lasers")
+	if not container then return end
+	for _, p in ipairs(container:GetChildren()) do
+		if p.Name == "Laser" and (not color or p.Color == color) then
+			p:Destroy()
 		end
 	end
+	-- keep our local list consistent
+	table.clear(laserSegments)
 end
 
--- Delete any filler parts we created during goal animation
+-- Destroy the temporary filler visuals
 local function DeleteFillers()
-	for _, filler in ipairs(laserFillers) do
-		if filler and filler.Parent then filler:Destroy() end
-	end
-	laserFillers = {}
-end
-
--- Create animated cylindrical fillers between a laser and its goal (visual flourish)
-local function CreateFillers(laser, goal)
-	if not laser then return end
-	local function makeFiller(pos, color)
-		local filler = Instance.new("Part")
-		filler.Anchored = true
-		filler.Shape = Enum.PartType.Cylinder
-		filler.Orientation = Vector3.new(0, 0, 90)
-		filler.Position = pos
-		filler.Size = Vector3.new(0.01, 0.01, 0.01)
-		filler.Color = color
-		filler.Material = Enum.Material.Neon
-		filler.Parent = workspace:FindFirstChild("Temp") or workspace
-		TweenService:Create(filler, TweenInfo.new(3, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {Size = Vector3.new(0.01, 3.7, 3.7)}):Play()
-		table.insert(laserFillers, filler)
-	end
-
-	makeFiller(laser.Position, laser.Color)
-	if goal then makeFiller(goal.Position, goal.Color) end
-end
-
--- Main laser shoot routine. Traces laser through scene, handles mirrors, splitters, and goals.
-local function Shoot(Laser)
-	-- remove previous segments of this laser color for clarity
-	ClearLaserSegments(Laser.Color)
-	laserSegments = {}
-
-	-- local recursion to step laser rays forward
-	local function Step(currentPos, currentNormal, bounceCount, color, isSplitterHit)
-		if bounceCount >= 50 then return end
-		local params = RaycastParams.new()
-		local direction = currentNormal.Unit * 1000
-		params.FilterType = Enum.RaycastFilterType.Exclude
-
-		-- Build filter list safely: exclude this laser part and the lasers container.
-		local filterList = {}
-		if typeof(Laser) == "Instance" then table.insert(filterList, Laser) end
-		if workspace:FindFirstChild("Lasers") then table.insert(filterList, workspace.Lasers) end
-		-- Exclude temporary fillers if they exist
-		for _, f in ipairs(laserFillers) do
-			if f and f:IsA("BasePart") then table.insert(filterList, f) end
+	for _, f in ipairs(laserFillers) do
+		if f and f.Parent then
+			f:Destroy()
 		end
-		-- exclude level glass if available
-		if LevelMap and LevelMap:FindFirstChild("Glass") then table.insert(filterList, LevelMap.Glass) end
+	end
+	table.clear(laserFillers)
+end
+
+-- Create a small filler effect (a neon cylinder that expands).
+-- This is purely visual to emphasize a goal being hit.
+local function CreateFiller(position, color)
+	if not position then return end
+	local filler = Instance.new("Part")
+	filler.Anchored = true
+	filler.Shape = Enum.PartType.Cylinder
+	filler.Orientation = Vector3.new(0, 0, 90)
+	filler.Position = position
+	filler.Size = Vector3.new(0.01, 0.01, 0.01)
+	filler.Color = color
+	filler.Material = Enum.Material.Neon
+	filler.Parent = workspace:FindFirstChild("Temp") or workspace
+	local tween = TweenService:Create(filler, TweenInfo.new(FILLER_TWEEN_TIME, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {Size = Vector3.new(0.01, 3.7, 3.7)})
+	tween:Play()
+	table.insert(laserFillers, filler)
+end
+
+-- Convenience wrapper to create pair of fillers for laser + goal
+local function CreateFillers(laserPart, goalPart)
+	if not laserPart then return end
+	CreateFiller(laserPart.Position, laserPart.Color)
+	if goalPart then
+		CreateFiller(goalPart.Position, goalPart.Color)
+	end
+end
+
+-- Trace a single laser through the scene, handling mirrors, fixers, splitters, and goals.
+local function Shoot(laser)
+	if not (laser and laser:IsA("BasePart")) then return end
+
+	-- Clean up previous segments for this laser color
+	ClearLaserSegments(laser.Color)
+
+	-- local references to speed up access
+	local levelMap = LevelMap
+
+	-- Raycast params builder
+	local function buildParams()
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		local filterList = {}
+
+		-- exclude the laser part and the rendered container of lasers
+		table.insert(filterList, laser)
+		local lasersContainer = workspace:FindFirstChild("Lasers")
+		if lasersContainer then table.insert(filterList, lasersContainer) end
+
+		-- exclude any temporary filler visuals
+		for _, f in ipairs(laserFillers) do
+			if f and f:IsA("BasePart") then
+				table.insert(filterList, f)
+			end
+		end
+
+		-- exclude level glass if present (prevents self-hit)
+		if levelMap and levelMap:FindFirstChild("Glass") then
+			table.insert(filterList, levelMap.Glass)
+		end
 
 		params.FilterDescendantsInstances = filterList
+		return params
+	end
 
+	-- Step function: recursive ray stepping. Keeps logic limited and readable.
+	local function Step(currentPos, currentDir, bounceCount, color, fromSplitter)
+		if bounceCount >= MAX_BOUNCES then return end
+		if not (currentPos and currentDir) then return end
+
+		local params = buildParams()
+		local direction = currentDir.Unit * MAX_LASER_DISTANCE
 		local result = workspace:Raycast(currentPos, direction, params)
-		local endPos
+		local endPos = nil
+
 		if result then
 			endPos = result.Position
 			local hitPart = result.Instance
-			if hitPart and hitPart.Parent and hitPart.Parent.Name == "Tech" and hitPart.Name == "Fixer" then
-				-- Fixer simply flips the normal on the axis it detects
-				local normal = result.Normal
-				if normal == Vector3.new(0, 0, 1) then currentNormal = Vector3.new(0, 0, -1)
-				elseif normal == Vector3.new(0, 0, -1) then currentNormal = Vector3.new(0, 0, 1)
-				elseif normal == Vector3.new(1, 0, 0) then currentNormal = Vector3.new(-1, 0, 0)
-				elseif normal == Vector3.new(-1, 0, 0) then currentNormal = Vector3.new(1, 0, 0)
-				elseif normal == Vector3.new(0, 1, 0) then currentNormal = Vector3.new(0, 1, 0)
-				elseif normal == Vector3.new(0, -1, 0) then currentNormal = Vector3.new(0, -1, 0) end
-				local segment = CreateLaserSegment(currentPos, endPos, color)
-				table.insert(laserSegments, {startPos = currentPos, endPos = endPos, Part = segment})
-				Step(endPos, currentNormal, bounceCount + 1, color, false)
+			local normal = result.Normal
 
-			elseif hitPart and hitPart.Parent and hitPart.Parent.Name == "Tech" and hitPart.Name == "Splitter" then
-				-- Splitter spawns multiple rays: keep it simple, three directions
-				local normal = result.Normal
-				if normal == Vector3.new(0, 0, 1) then currentNormal = Vector3.new(0, 0, -1)
-				elseif normal == Vector3.new(0, 0, -1) then currentNormal = Vector3.new(0, 0, 1)
-				elseif normal == Vector3.new(1, 0, 0) then currentNormal = Vector3.new(-1, 0, 0)
-				elseif normal == Vector3.new(-1, 0, 0) then currentNormal = Vector3.new(1, 0, 0)
-				elseif normal == Vector3.new(0, 1, 0) then currentNormal = Vector3.new(0, 1, 0)
-				elseif normal == Vector3.new(0, -1, 0) then currentNormal = Vector3.new(0, -1, 0) end
+			-- Helper: record visual segment
+			local function recordSegment()
+				local seg = CreateLaserSegment(currentPos, endPos, color)
+				table.insert(laserSegments, {startPos = currentPos, endPos = endPos, Part = seg})
+			end
 
-				local offsetDistance = 2
-				local splitStartPos = hitPart.Position + currentNormal.Unit * offsetDistance
-				local rightVector = currentNormal:Cross(Vector3.new(0, 1, 0)).Unit
-				if rightVector.Magnitude < 0.01 then rightVector = currentNormal:Cross(Vector3.new(1, 0, 0)).Unit end
-				local splitNormals = {currentNormal + rightVector * 0.5, currentNormal - rightVector * 0.5, currentNormal}
-				for _, newNormal in ipairs(splitNormals) do
-					Step(splitStartPos, newNormal.Unit, bounceCount + 1, color, true)
-				end
-				if not isSplitterHit then
+			-- Tech pieces are grouped under a "Tech" parent; handle special names
+			if hitPart and hitPart.Parent and hitPart.Parent.Name == "Tech" then
+				if hitPart.Name == "Fixer" then
+					-- Fixer flips direction on the axis most aligned with the normal.
+					-- Use axis approximation for reliability.
+					local newDir = currentDir
+					if isAxis(normal, Vector3.new(0, 0, 1)) or isAxis(normal, Vector3.new(0, 0, -1)) then
+						newDir = Vector3.new(currentDir.X, currentDir.Y, -currentDir.Z)
+					elseif isAxis(normal, Vector3.new(1, 0, 0)) or isAxis(normal, Vector3.new(-1, 0, 0)) then
+						newDir = Vector3.new(-currentDir.X, currentDir.Y, currentDir.Z)
+					end
+					recordSegment()
+					Step(endPos, newDir.Unit, bounceCount + 1, color, false)
+
+				elseif hitPart.Name == "Splitter" then
+					-- Splitter spawns three rays around the original direction.
+					-- Make small angular offsets using a cross vector; handle degenerate cross.
+					local rightVector = currentDir:Cross(Vector3.new(0, 1, 0))
+					if rightVector.Magnitude < 0.01 then
+						rightVector = currentDir:Cross(Vector3.new(1, 0, 0))
+					end
+					rightVector = rightVector.Unit
+					local splitNormals = {
+						(currentDir + rightVector * 0.5).Unit,
+						(currentDir - rightVector * 0.5).Unit,
+						currentDir.Unit
+					}
+					-- Start the split a small offset away from the part to prevent immediate re-hits
+					local offsetStart = hitPart.Position + currentDir.Unit * 2
+					for _, nrm in ipairs(splitNormals) do
+						Step(offsetStart, nrm, bounceCount + 1, color, true)
+					end
+					-- Draw the incoming segment only once for the splitter
+					if not fromSplitter then recordSegment() end
+
+				else
+					-- Unknown tech part: treat as opaque; record segment and stop
 					local segment = CreateLaserSegment(currentPos, endPos, color)
 					table.insert(laserSegments, {startPos = currentPos, endPos = endPos, Part = segment})
 				end
+
+			elseif hitPart and hitPart.Parent and hitPart.Parent.Name == "Mirrors" then
+				-- Reflect off mirrors using the reflection formula r = v - 2*(v·n)*n
+				local reflect = currentDir - (2 * currentDir:Dot(normal) * normal)
+				recordSegment()
+				Step(endPos, reflect.Unit, bounceCount + 1, color, false)
 
 			else
-				-- Mirror reflection or end-of-path logic
-				if hitPart and hitPart.Parent and hitPart.Parent.Name == "Mirrors" then
-					local norm = result.Normal
-					currentNormal = currentNormal - (2 * currentNormal:Dot(norm) * norm)
-					local segment = CreateLaserSegment(currentPos, endPos, color)
-					table.insert(laserSegments, {startPos = currentPos, endPos = endPos, Part = segment})
-					Step(endPos, currentNormal, bounceCount + 1, color, false)
-				else
-					-- Goal detection: a laser hit its own goal part
-					if hitPart and hitPart.Name == Laser.Name and hitPart.Parent and hitPart.Parent.Name == "Goals" then
-						if not lasersHitGoal[Laser.Name] then
-							lasersHitGoal[Laser.Name] = true
-							local allHit = true
-							for _, v in pairs((LevelMap and LevelMap.Lasers and LevelMap.Lasers:GetChildren()) or {}) do
-								if not lasersHitGoal[v.Name] then allHit = false break end
+				-- Non-tech, non-mirror hit: could be a goal.
+				if hitPart and hitPart.Name == laser.Name and hitPart.Parent and hitPart.Parent.Name == "Goals" then
+					-- first time this laser hits its goal -> mark and check for overall completion
+					if not lasersHitGoal[laser.Name] then
+						lasersHitGoal[laser.Name] = true
+
+						-- if all lasers are hitting their goals, start the timer and animate fillers
+						local allHit = true
+						for _, v in ipairs((levelMap and levelMap.Lasers and levelMap.Lasers:GetChildren()) or {}) do
+							if not lasersHitGoal[v.Name] then
+								allHit = false
+								break
 							end
-							if allHit then
-								timeOfLastHit = tick()
-								for _, laser in ipairs((LevelMap and LevelMap.Lasers and LevelMap.Lasers:GetChildren()) or {}) do
-									local goal = (LevelMap and LevelMap.Goals) and LevelMap.Goals:FindFirstChild(laser.Name)
-									if laser and goal then CreateFillers(laser, goal) end
+						end
+						if allHit then
+							timeOfLastHit = tick()
+							for _, l in ipairs((levelMap and levelMap.Lasers and levelMap.Lasers:GetChildren()) or {}) do
+								local goalPart = (levelMap and levelMap.Goals) and levelMap.Goals:FindFirstChild(l.Name)
+								if l and goalPart then
+									CreateFillers(l, goalPart)
 								end
 							end
 						end
-					else
-						-- If we previously were hitting goal and now no longer, reset the state
-						if lasersHitGoal[Laser.Name] then
-							lasersHitGoal[Laser.Name] = false
-							DeleteFillers()
-						end
 					end
-					local segment = CreateLaserSegment(currentPos, endPos, color)
-					table.insert(laserSegments, {startPos = currentPos, endPos = endPos, Part = segment})
+				else
+					-- If we were previously hitting the goal but now no longer, reset state.
+					if lasersHitGoal[laser.Name] then
+						lasersHitGoal[laser.Name] = false
+						DeleteFillers()
+					end
 				end
+
+				-- Draw the final segment to the hit point
+				local segment = CreateLaserSegment(currentPos, endPos, color)
+				table.insert(laserSegments, {startPos = currentPos, endPos = endPos, Part = segment})
 			end
 		else
-			-- No hit: draw until max distance
+			-- No hit: draw a long segment to max distance
 			endPos = currentPos + direction
 			local segment = CreateLaserSegment(currentPos, endPos, color)
 			table.insert(laserSegments, {startPos = currentPos, endPos = endPos, Part = segment})
 		end
 	end
 
-	-- Start the ray from the laser part
-	local startPos = Laser.Position
-	local startNormal = Laser.CFrame.LookVector
-	local color = Laser.Color -- fixed capitalization bug
-	Step(startPos, startNormal, 0, color)
+	-- Start the ray from the laser's position and forward look vector
+	Step(laser.Position, laser.CFrame.LookVector, 0, laser.Color, false)
 end
 
--- Smooth camera transitions between levels
+-- Smooth camera movement between camera parts (guard for missing parts)
 local function MoveCam()
-	local camPart = workspace.LCamParts:WaitForChild("Cam" .. tostring(Level.Value))
-	local camPart2 = workspace.LCamParts:WaitForChild("Cam" .. tostring(Level.Value + 1))
-	local tween = TweenService:Create(cam, TweenInfo.new(.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {CFrame = camPart.CFrame + Vector3.new(0, 10, 0)})
-	tween:Play()
-	tween.Completed:Wait(1)
-	local tween2 = TweenService:Create(cam, TweenInfo.new(1, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {CFrame = camPart2.CFrame + Vector3.new(0, 10, 0)})
-	tween2:Play()
-	tween2.Completed:Wait(1)
-	local tween3 = TweenService:Create(cam, TweenInfo.new(.1, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {CFrame = camPart2.CFrame})
-	tween3:Play()
-	tween3.Completed:Wait(1)
+	local camParts = workspace:FindFirstChild("LCamParts")
+	if not camParts then return end
+
+	local currentCam = camParts:FindFirstChild("Cam" .. tostring(Level.Value))
+	local nextCam = camParts:FindFirstChild("Cam" .. tostring(Level.Value + 1))
+
+	if not currentCam then return end
+	cam.CFrame = currentCam.CFrame
+
+	-- Transition to next camera if available, else just perform a subtle bounce
+	if nextCam then
+		local tween1 = TweenService:Create(cam, TweenInfo.new(0.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {CFrame = currentCam.CFrame + Vector3.new(0, 10, 0)})
+		tween1:Play()
+		tween1.Completed:Wait()
+		local tween2 = TweenService:Create(cam, TweenInfo.new(1, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {CFrame = nextCam.CFrame + Vector3.new(0, 10, 0)})
+		tween2:Play()
+		tween2.Completed:Wait()
+		local tween3 = TweenService:Create(cam, TweenInfo.new(0.1, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {CFrame = nextCam.CFrame})
+		tween3:Play()
+		tween3.Completed:Wait()
+	end
+
 	Level.Value = Level.Value + 1
 end
 
--- Called when the player has completed a level: turn lasers and goals green, animate, and advance
+-- When the player completes a level: color lasers/goals green, animate fillers, stop the loop
 local function HandleWin()
-	for _, laser in ipairs((LevelMap and LevelMap.Lasers and LevelMap.Lasers:GetChildren()) or {}) do
-		for _, segment in ipairs((workspace:FindFirstChild("Lasers") and workspace.Lasers:GetChildren()) or {}) do
-			if segment.Name == "Laser" then segment.Color = Color3.fromRGB(0, 255, 0) end
+	if not LevelMap then return end
+
+	-- color all laser visuals green
+	for _, seg in ipairs((workspace:FindFirstChild("Lasers") and workspace.Lasers:GetChildren()) or {}) do
+		if seg.Name == "Laser" then
+			seg.Color = Color3.fromRGB(0, 255, 0)
 		end
-		local goal = LevelMap.Goals:FindFirstChild(laser.Name)
-		if laser and goal then
-			laser.Color = Color3.fromRGB(0, 255, 0)
+	end
+
+	-- color lasers and goals in the level green and create fillers
+	for _, laserPart in ipairs((LevelMap and LevelMap.Lasers and LevelMap.Lasers:GetChildren()) or {}) do
+		local goal = (LevelMap and LevelMap.Goals) and LevelMap.Goals:FindFirstChild(laserPart.Name)
+		if laserPart and goal then
+			laserPart.Color = Color3.fromRGB(0, 255, 0)
 			goal.Color = Color3.fromRGB(0, 255, 0)
+			CreateFillers(laserPart, goal)
 		end
 	end
-	for i, filler in ipairs(laserFillers) do
-		if filler then filler.Color = Color3.fromRGB(0, 255, 0) end
-	end
-	for _, laser in ipairs((LevelMap and LevelMap.Lasers and LevelMap.Lasers:GetChildren()) or {}) do
-		local goal = LevelMap.Goals:FindFirstChild(laser.Name)
-		if laser and goal then CreateFillers(laser, goal) end
-	end
+
 	laserActive = false
-	for _, connection in ipairs(heartbeatConnections) do
-		if connection.Connected then connection:Disconnect() end
+
+	-- disconnect heartbeat connections cleanly
+	for _, conn in ipairs(heartbeatConnections) do
+		if conn and conn.Connected then
+			conn:Disconnect()
+		end
 	end
-	heartbeatConnections = {}
-	wait(1)
+	table.clear(heartbeatConnections)
+
+	-- small pause then transition camera/level
+	task.wait(1)
 	MoveCam()
 end
 
--- Check whether all lasers currently hit their goals and enough time has passed
+-- Check if all lasers are hitting their goals and enough time has elapsed to confirm win
 local function CheckForWin()
+	if not LevelMap then return end
 	local allHit = true
-	for _, v in pairs((LevelMap and LevelMap.Lasers and LevelMap.Lasers:GetChildren()) or {}) do
-		if not lasersHitGoal[v.Name] then allHit = false break end
+	for _, v in ipairs((LevelMap and LevelMap.Lasers and LevelMap.Lasers:GetChildren()) or {}) do
+		if not lasersHitGoal[v.Name] then
+			allHit = false
+			break
+		end
 	end
-	if allHit and timeOfLastHit and tick() - timeOfLastHit >= timeToWait then
+	if allHit and timeOfLastHit and tick() - timeOfLastHit >= WAIT_AFTER_ALL_HIT then
 		HandleWin()
 	end
 end
 
--- When level number changes, set up level map and heartbeat shoot loops
+-- When level changes, prepare the new level: reset visuals and start each laser's heartbeat loop
 Level.Changed:Connect(function()
-	LevelMap = workspace.Levels:WaitForChild("L" .. tostring(Level.Value))
-	laserActive = true
-	ClearLaserSegments() -- clear everything
-	DeleteFillers()
-	lasersHitGoal = {}
-	pointingAtTarget, pointingStartTime, timeOfLastHit = false, nil, nil
-	local camPart = workspace.LCamParts:WaitForChild("Cam" .. tostring(Level.Value))
-	cam.CFrame = camPart.CFrame
+	LevelMap = workspace:FindFirstChild("Levels") and workspace.Levels:FindFirstChild("L" .. tostring(Level.Value))
+	if not LevelMap then return end
 
-	for i, v in pairs(LevelMap.Lasers:GetChildren()) do
-		spawn(function()
-			local Goal = LevelMap.Goals:FindFirstChild(v.Name)
-			local connection
-			connection = RunService.Heartbeat:Connect(function()
-				if laserActive then
-					Shoot(v)
-					if pointingAtTarget and pointingStartTime then
-						if tick() - pointingStartTime >= 3 then
-							HandleWin(v, Goal)
-							pointingAtTarget, pointingStartTime = false, nil
-						end
-					end
-					CheckForWin()
+	laserActive = true
+	ClearLaserSegments()
+	DeleteFillers()
+	table.clear(lasersHitGoal)
+	pointingAtTarget, pointingStartTime, timeOfLastHit = false, nil, nil
+
+	-- Position camera at level start
+	local camParts = workspace:FindFirstChild("LCamParts")
+	if camParts then
+		local startCam = camParts:FindFirstChild("Cam" .. tostring(Level.Value))
+		if startCam then cam.CFrame = startCam.CFrame end
+	end
+
+	-- For each laser in the level, spawn a heartbeat loop to update its trace.
+	for _, laserPart in ipairs((LevelMap and LevelMap.Lasers and LevelMap.Lasers:GetChildren()) or {}) do
+		task.spawn(function()
+			-- keep track of connection to allow cleanup later
+			local conn = RunService.Heartbeat:Connect(function()
+				if not laserActive then return end
+				Shoot(laserPart)
+				-- optional: allow pointing-based quick-win if you implement pointing elsewhere
+				if pointingAtTarget and pointingStartTime and tick() - pointingStartTime >= WAIT_AFTER_ALL_HIT then
+					HandleWin()
+					pointingAtTarget, pointingStartTime = false, nil
 				end
+				CheckForWin()
 			end)
-			table.insert(heartbeatConnections, connection)
+			table.insert(heartbeatConnections, conn)
 		end)
 	end
 end)
 
--- start at level one
+-- start at level 1
 Level.Value = 1
 
--- Input handling section (mouse/touch/keyboard)
-local UserInputService = game:GetService("UserInputService")
-local Players = game:GetService("Players")
-local Debris = game:GetService("Debris")
-local LocalPlayer = Players.LocalPlayer
-local mouse = LocalPlayer:GetMouse()
+-- INPUT AND MOVEMENT HANDLING
+local mouse = localPlayer:GetMouse()
 local selectedPart = nil
 
--- Utility: check if a moving part is intersecting any relevant static geometry
+-- Utility: report whether 'part' overlaps any relevant static geometry we care about.
 local function isTouchingWall(part)
 	if not part then return false end
-	for _, otherPart in workspace:GetPartsInPart(part) do
+	-- using GetPartsInPart is efficient and direct for overlapping checks
+	for _, otherPart in ipairs(workspace:GetPartsInPart(part)) do
 		if otherPart:IsDescendantOf(workspace:FindFirstChild("Walls") or workspace)
 		or (LevelMap and otherPart:IsDescendantOf(LevelMap:FindFirstChild("Glass") or workspace))
 		or (LevelMap and otherPart:IsDescendantOf(LevelMap:FindFirstChild("Lasers") or workspace))
@@ -311,88 +421,91 @@ local function isTouchingWall(part)
 	return false
 end
 
--- Move selected part toward a target position in small increments to avoid tunneling
-local function MoveTo(Pos)
-	if not selectedPart then return end
-	local startPos = selectedPart.Position
-	local delta = Pos - startPos
-	local i = 0
-	repeat
-		local lastPos = selectedPart.Position
-		selectedPart.Position = selectedPart.Position + delta / 100
-		if #workspace:GetPartsInPart(selectedPart) > 0 then
-			selectedPart.Position = lastPos
+-- Move selected part safely toward a target in small steps to avoid tunnelling.
+local function MoveToSafe(part, target)
+	if not (part and target) then return end
+	local startPos = part.Position
+	local delta = target - startPos
+	local steps = 100
+	local stepVec = delta / steps
+	for i = 1, steps do
+		local last = part.Position
+		part.Position = part.Position + stepVec
+		if #workspace:GetPartsInPart(part) > 0 then
+			part.Position = last
 			break
 		end
-		i = i + 1
-	until i >= 100
+		task.wait()
+	end
 end
 
--- Move part axis-aligned with simple wall checks (keeps Y stable)
+-- Axis-aligned incremental movement with separate X/Z trials to simplify collision fixes.
 local function movePart(targetPosition, part)
-	if not part then return end
-	local startPos = part.Position
-	local delta = targetPosition - startPos
-	local stepCount = 10
-	local stepSize = delta / stepCount
+	if not (part and targetPosition) then return end
 	local lastPos = part.Position
 	-- try X
 	part.Position = Vector3.new(targetPosition.X, part.Position.Y, part.Position.Z)
-	if isTouchingWall(part) then part.Position = lastPos end
+	if isTouchingWall(part) then
+		part.Position = lastPos
+	end
 	lastPos = part.Position
 	-- try Z
 	part.Position = Vector3.new(part.Position.X, part.Position.Y, targetPosition.Z)
-	if isTouchingWall(part) then part.Position = lastPos end
+	if isTouchingWall(part) then
+		part.Position = lastPos
+	end
 end
 
--- Fix small embedding into walls by nudging slightly
+-- Fix small embedding by nudging slightly along X
 local function fixGap(part)
 	if not part then return end
 	local wallOffset = 0.1
-	local wallPosition = part.Position
 	if isTouchingWall(part) then
-		part.Position = Vector3.new(wallPosition.X + wallOffset, wallPosition.Y, wallPosition.Z)
+		part.Position = Vector3.new(part.Position.X + wallOffset, part.Position.Y, part.Position.Z)
 	end
 end
 
--- Play a sound stored under this script by name (I keep sounds as children)
+-- Play a local sound childed to this script by name
 local function playSound(soundName)
 	local snd = script:FindFirstChild(soundName)
-	if snd and snd:IsA("Sound") then
-		local soundClone = snd:Clone()
-		soundClone.Parent = workspace
-		Debris:AddItem(soundClone, 1)
-		soundClone:Play()
-	end
+	if not (snd and snd:IsA("Sound")) then return end
+	local clone = snd:Clone()
+	clone.Parent = workspace
+	Debris:AddItem(clone, 1)
+	clone:Play()
 end
 
--- Mouse drag for desktop
+-- Desktop mouse drag logic; keep loop short and responsive
 mouse.Button1Down:Connect(function()
 	if not (LevelMap and LevelMap:FindFirstChild("Mirrors")) then return end
 	local target = mouse.Target
+	if not (target and target:IsDescendantOf(LevelMap:WaitForChild("Mirrors"))) then return end
+	local canDrag = target:FindFirstChild("CanDrag")
+	if not (canDrag and canDrag.Value) then return end
+
 	selectedPart = target
-	if target and target:IsDescendantOf(LevelMap:WaitForChild("Mirrors")) and target:FindFirstChild("CanDrag") and target.CanDrag.Value then
-		selectedPart = target
-		playSound("Click")
-		while UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) do
-			local targetPosition = mouse.Hit.Position
-			local Goal = Vector3.new(targetPosition.X, selectedPart.Position.Y, targetPosition.Z)
-			local Pos = selectedPart.Position:Lerp(Goal, .3)
-			MoveTo(Vector3.new(Pos.X, Pos.Y, selectedPart.Position.Z))
-			MoveTo(Vector3.new(selectedPart.Position.X, Pos.Y, Pos.Z))
-			fixGap(selectedPart)
-			task.wait()
-		end
-		selectedPart = nil
-		playSound("Click")
+	playSound("Click")
+	-- While the mouse button is held, move the part smoothly towards the cursor
+	while UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) and selectedPart do
+		local targetPosition = mouse.Hit.Position
+		local goal = Vector3.new(targetPosition.X, selectedPart.Position.Y, targetPosition.Z)
+		local pos = selectedPart.Position:Lerp(goal, 0.3)
+		MoveToSafe(selectedPart, Vector3.new(pos.X, pos.Y, selectedPart.Position.Z))
+		MoveToSafe(selectedPart, Vector3.new(selectedPart.Position.X, pos.Y, pos.Z))
+		fixGap(selectedPart)
+		task.wait()
 	end
+	selectedPart = nil
+	playSound("Click")
 end)
 
--- Touch controls (simple)
+-- Touch handling: touch start selects, moved updates, end deselects.
 UserInputService.TouchStarted:Connect(function(input, gameProcessed)
 	if gameProcessed then return end
 	local target = mouse.Target
-	if target and LevelMap and target:IsDescendantOf(LevelMap:WaitForChild("Mirrors")) and target:FindFirstChild("CanDrag") and target.CanDrag.Value then
+	if not (LevelMap and target and target:IsDescendantOf(LevelMap:WaitForChild("Mirrors"))) then return end
+	local canDrag = target:FindFirstChild("CanDrag")
+	if canDrag and canDrag.Value then
 		selectedPart = target
 	end
 end)
@@ -400,10 +513,10 @@ end)
 UserInputService.TouchMoved:Connect(function(input, gameProcessed)
 	if gameProcessed or not selectedPart then return end
 	local targetPosition = mouse.Hit.Position
-	local Goal = Vector3.new(targetPosition.X, selectedPart.Position.Y, targetPosition.Z)
-	local Pos = selectedPart.Position:Lerp(Goal, .3)
-	MoveTo(Vector3.new(Pos.X, Pos.Y, selectedPart.Position.Z))
-	MoveTo(Vector3.new(selectedPart.Position.X, Pos.Y, Pos.Z))
+	local goal = Vector3.new(targetPosition.X, selectedPart.Position.Y, targetPosition.Z)
+	local pos = selectedPart.Position:Lerp(goal, 0.3)
+	MoveToSafe(selectedPart, Vector3.new(pos.X, pos.Y, selectedPart.Position.Z))
+	MoveToSafe(selectedPart, Vector3.new(selectedPart.Position.X, pos.Y, pos.Z))
 	fixGap(selectedPart)
 end)
 
@@ -412,16 +525,18 @@ UserInputService.TouchEnded:Connect(function(input, gameProcessed)
 	selectedPart = nil
 end)
 
--- Mobile rotate buttons
+-- Mobile rotation: single event binding per button to avoid repeated connections.
 if UserInputService.TouchEnabled then
-	local leftButton = LocalPlayer:WaitForChild("PlayerGui"):WaitForChild("Mobile"):WaitForChild("Left")
-	local rightButton = LocalPlayer.PlayerGui.Mobile.Right
-	local function rotatePart(clockwise)
-		if selectedPart then
-			local isPressed = true
-			local angleStep = clockwise and 1.2 or -1.2
-			leftButton.MouseButton1Up:Connect(function() isPressed = false end)
-			while isPressed and selectedPart do
+	local mobileGui = playerGui:FindFirstChild("Mobile")
+	if mobileGui then
+		local leftButton = mobileGui:FindFirstChild("Left")
+		local rightButton = mobileGui:FindFirstChild("Right")
+
+		local function rotateLoop(direction) -- direction positive rotates clockwise
+			if not selectedPart then return end
+			local rotating = true
+			while rotating and selectedPart do
+				local angleStep = direction * 1.2
 				selectedPart.Orientation = selectedPart.Orientation + Vector3.new(0, angleStep, 0)
 				if isTouchingWall(selectedPart) then
 					selectedPart.Orientation = selectedPart.Orientation - Vector3.new(0, angleStep, 0)
@@ -429,29 +544,65 @@ if UserInputService.TouchEnabled then
 				task.wait()
 			end
 		end
-	end
-	leftButton.MouseButton1Down:Connect(function() rotatePart(true) end)
-	rightButton.MouseButton1Down:Connect(function() rotatePart(false) end)
-end
 
--- Keyboard rotate (hold R to rotate the selected mirror)
-local rotating, rotationSpeed, rotateAmount = false, .01, 2
-UserInputService.InputBegan:Connect(function(input, gameProcessed)
-	if gameProcessed then return end
-	if input.KeyCode == Enum.KeyCode.R and selectedPart and selectedPart:FindFirstChild("CanRotate") and selectedPart.CanRotate.Value then
-		rotating = true
-		while rotating and selectedPart do
-			selectedPart.Orientation = selectedPart.Orientation + Vector3.new(0, rotateAmount, 0)
-			if isTouchingWall(selectedPart) then
-				selectedPart.Orientation = selectedPart.Orientation - Vector3.new(0, rotateAmount, 0)
-			end
-			task.wait(rotationSpeed)
+		if leftButton then
+			local active = false
+			leftButton.MouseButton1Down:Connect(function()
+				if active or not selectedPart then return end
+				active = true
+				task.spawn(function()
+					rotateLoop(1)
+					active = false
+				end)
+			end)
+			leftButton.MouseButton1Up:Connect(function()
+				active = false
+			end)
+		end
+
+		if rightButton then
+			local active = false
+			rightButton.MouseButton1Down:Connect(function()
+				if active or not selectedPart then return end
+				active = true
+				task.spawn(function()
+					rotateLoop(-1)
+					active = false
+				end)
+			end)
+			rightButton.MouseButton1Up:Connect(function()
+				active = false
+			end)
 		end
 	end
-end)
+end
 
-UserInputService.InputEnded:Connect(function(input)
-	if input.KeyCode == Enum.KeyCode.R then
-		rotating = false
-	end
-end)
+-- Keyboard rotation: hold 'R' to rotate selected mirror.
+do
+	local rotating = false
+	local rotateAmount = 2 -- degrees per step
+	local rotationSpeed = 0.01
+
+	UserInputService.InputBegan:Connect(function(input, gameProcessed)
+		if gameProcessed then return end
+		if input.KeyCode == Enum.KeyCode.R and selectedPart and selectedPart:FindFirstChild("CanRotate") and selectedPart.CanRotate.Value then
+			if rotating then return end
+			rotating = true
+			task.spawn(function()
+				while rotating and selectedPart do
+					selectedPart.Orientation = selectedPart.Orientation + Vector3.new(0, rotateAmount, 0)
+					if isTouchingWall(selectedPart) then
+						selectedPart.Orientation = selectedPart.Orientation - Vector3.new(0, rotateAmount, 0)
+					end
+					task.wait(rotationSpeed)
+				end
+			end)
+		end
+	end)
+
+	UserInputService.InputEnded:Connect(function(input)
+		if input.KeyCode == Enum.KeyCode.R then
+			rotating = false
+		end
+	end)
+end
